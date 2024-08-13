@@ -1,0 +1,4 @@
+# ninja log v5
+0	9985	1718869120304570694	/data2/hkk/3dgs/flowmap/submodules/simple-knn/build/temp.linux-x86_64-cpython-311/simple_knn.o	dc0d10bee84c2a7b
+0	14339	1718869124648568094	/data2/hkk/3dgs/flowmap/submodules/simple-knn/build/temp.linux-x86_64-cpython-311/ext.o	e6d661ef3c532897
+0	45637	1718869155924555854	/data2/hkk/3dgs/flowmap/submodules/simple-knn/build/temp.linux-x86_64-cpython-311/spatial.o	634ccc3abcc9b49d
