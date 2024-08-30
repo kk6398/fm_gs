@@ -9,6 +9,8 @@ from torch import optim
 # import cv2
 import json
 import numpy as np
+from PIL import Image
+import torchvision.transforms.functional as tf
 from ..dataset.types import Batch
 from ..flow import Flows
 from ..loss import Loss
@@ -31,10 +33,11 @@ from ..utils.image_utils import psnr
 from time import time
 from ..utils.loss_utils import l1_loss, ssim
 from ..export.flowmap2gs import flowmap_2_gs, save_json, xyz_from_flowmap
-from ..scene.dataset_readers import readFlowmapSceneInfo, readColmapSceneInfo
+from ..scene.dataset_readers import readFlowmapSceneInfo, readColmapSceneInfo, readSceneInfo
 from ..utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, camera_from_camInfos_selection
 from torch.optim.lr_scheduler import StepLR
 from ..misc.cropping import center_crop_intrinsics
+from ..lpipsPyTorch import lpips
 
 
 @dataclass
@@ -87,6 +90,9 @@ class ModelWrapperOverfit(LightningModule):
         self.viewp = None
         self.cameras_extent = None
         self.sceneinfo = None
+        self.depth = None
+        self.intrinsics = None
+        self.extrinsics = None
     def to(self, device: torch.device) -> None:
         self.batch = self.batch.to(device)
         self.flows = self.flows.to(device)
@@ -96,11 +102,13 @@ class ModelWrapperOverfit(LightningModule):
 
     def training_step(self, dummy):
         choice = 1          # 选择模式, 1:flowmap      2:colmap
-        iteration_gs = 2000
+        iteration_gs = 2000    # 决定多少iteration后进行gs render
+        num_images = 3
         ### Step1. Compute depths, poses, and intrinsics using the model.
         model_output = self.model(self.batch, self.flows, self.global_step)  # self.global_step: 0
         # print("self.batch.videos: ", self.batch.videos.shape)     # torch.Size([1, 20, 3, 160, 224])
-        depths = model_output.depths  # ([1, 20, 160, 224])
+        depths = model_output.depths  # ([1, 20, 160, 224])       # 128 256
+        # depths_upsampled = torch.nn.functional.interpolate(depths, size=(1200, 1600), mode='bilinear', align_corners=False)
         extrinsics = model_output.extrinsics  # torch.Size([1, 20, 4, 4])   tensor
         intrinsics = model_output.intrinsics  # torch.Size([1, 20, 3, 3])   # 20个图像内参是共享的，一样的
 
@@ -108,8 +116,8 @@ class ModelWrapperOverfit(LightningModule):
         # 选择1： 直接处理flowmap输出的相机参数，并进行传递render函数；
         ### Step2.1 Compute viewpoint_cam       # 内参应该现有(160,224) → (180,240)
         if self.global_step >= iteration_gs:      # 从第2000次迭代进行3dgs render
+        # if self.global_step == iteration_gs:      # 从第2000次迭代进行3dgs render
             if choice == 1:
-                # if self.global_step == iteration_gs:
                 _, _, h_cropped, w_cropped = depths.shape
                 h_uncropped, w_uncropped = self.uncropped_exports_shape
                 intrinsics_uncropped = center_crop_intrinsics(
@@ -118,20 +126,23 @@ class ModelWrapperOverfit(LightningModule):
                     (h_uncropped, w_uncropped),  # (180, 240)
                 )
                 extrinsics_colmap, intrinsics_colmap = flowmap_2_gs(intrinsics_uncropped[0], extrinsics[0], self.frame_paths,
-                                                                    self.uncropped_videos)  # 传入的是flowmap的输出，输出的是
-                scene_info = readFlowmapSceneInfo(extrinsics_colmap, intrinsics_colmap, self.dataset_root)
-                # self.sceneinfo = scene_info
+                                                                    self.uncropped_videos)  # 传入的是flowmap的输出，输出的是内外参   # self.uncropped_videos: [1,20,3,3024,4032]
+                # scene_info = readFlowmapSceneInfo(extrinsics_colmap, intrinsics_colmap, self.dataset_root, eval=True)
+                scene_info = readSceneInfo(extrinsics_colmap, intrinsics_colmap, self.dataset_root, eval=True, num_images=num_images)
 
                 ### 保存 cameras.json文件
                 save_json(scene_info)
 
                 random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
                 random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
-
+                # self.sceneinfo = scene_info
                 view_point_selcetion = randint(0, len(scene_info.train_cameras) - 1)  # 随机选一个视角
                 viewpoint_cam = camera_from_camInfos_selection(view_point_selcetion, scene_info.train_cameras,
                                                                resolution_scale=1, args=None)
                 # self.viewp = viewpoint_cam
+                # self.sceneinfo = scene_info
+                # self.intrinsics = intrinsics_uncropped
+                # self.extrinsics = extrinsics
                 # self.cameras_extent = self.sceneinfo.nerf_normalization["radius"]
             else:  # 选择2 通过生成colmap文件 cameras.bin images.bin，在读取colmap文件，生成对应相机参数
                 # if self.global_step == iteration_gs:
@@ -154,7 +165,7 @@ class ModelWrapperOverfit(LightningModule):
         ### Step2.2 Initialization for gaussians
         if self.global_step > iteration_gs:  # 因为self.global_step从0开始
             self.gaussians.update_learning_rate((self.global_step - iteration_gs))  # 根据当前迭代次数更新学习率
-            # lr = self.gaussians.update_learning_rate(self.global_step)
+            # lr = self.gaussians.update_learning_rate(self.global_step)s
             # self.log("train/loss/learning_rate", lr)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if self.global_step % 1000 == 0 and self.global_step > iteration_gs:  # 每1000次迭代，提升球谐函数的次数以改进模型复杂度     # 初始为0阶
@@ -164,21 +175,38 @@ class ModelWrapperOverfit(LightningModule):
         if self.global_step >= iteration_gs:      # 2000
             if self.global_step == iteration_gs:  # 2000
                 if choice == 1:
-                    self.gaussians.create_gaussian_params(intrinsics_uncropped, extrinsics, depths, self.batch,
-                                                          scene_info.nerf_normalization["radius"])  # self.batch: rgb
+                    # self.depth = depths
+                    # 根据训练视角的索引，选出训练视角，进行点云初始化
+                    # self.gaussians.create_gaussian_params(intrinsics_uncropped, extrinsics, depths, self.batch, scene_info.nerf_normalization["radius"])
+                    self.gaussians.create_fewshot_gaussian_params(intrinsics_uncropped, extrinsics, depths, self.batch,
+                                                          scene_info.nerf_normalization["radius"], num_images=num_images)
+                    # viewpoint_stack = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale=1, args=None)
+                    # input = self.uncropped_videos.permute(0, 2, 1, 3, 4)    # [1, 20, 3, 3024, 4032]
+                    # # 然后，我们可以使用 interpolate 函数进行上采样
+                    # output = torch.nn.functional.interpolate(input, size=(20, 1200, 1600), mode='trilinear', align_corners=False)
+                    #
+                    # # 最后，我们需要将输出的尺寸调整回 [batch_size, depth, channels, height, width]
+                    # image_1200_1600 = output.permute(0, 2, 1, 3, 4)
+                    # self.gaussians.create_gaussian_params(intrinsics_uncropped, extrinsics, depths_upsampled, image_1200_1600,
+                    #                                       scene_info.nerf_normalization["radius"])  # self.batch: rgb
                 else:  # 选择2 根据读取的colmap点云文件pcd，直接生成gaussian参数
                     self.gaussians.create_from_pcd(scene_info.point_cloud, self.scene_info.nerf_normalization['radius'])
                 self.gaussians.training_setup(self.opt_prams)
             # 直接传递self.background: [0,0,0]
 
-            xyz_flowmap = xyz_from_flowmap(depths, intrinsics_uncropped, extrinsics, self.batch)
+            xyz_flowmap = xyz_from_flowmap(depths, intrinsics_uncropped, extrinsics, self.batch, num_images=num_images)
+            # xyz_flowmap = xyz_from_flowmap(depths, self.intrinsics, self.extrinsics, self.batch)              # cameras不变
+            # xyz_flowmap = xyz_from_flowmap(self.depth, intrinsics_uncropped, extrinsics, self.batch)        # depth不变
 
             ### Step2.3 3dgs render         # render函数要引入每次由depth和cameras生成的  xyz
             # render_pkg = render(viewpoint_cam, self.gaussians, self.pipeline, self.background)
+            # render_pkg = render(self.viewp, self.gaussians, self.pipeline, self.background)
             render_pkg = render(viewpoint_cam, self.gaussians, xyz_flowmap, self.pipeline, self.background)
+            # render_pkg = render(self.viewp, self.gaussians, xyz_flowmap, self.pipeline, self.background)         # cameras不变
             render_image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[   # torch.Size([3, 1200, 1600])   torch.Size([560, 3])  torch.Size([560])  torch.Size([560])
                 "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+            # gt_image = viewpoint_cam.original_image.cuda()
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(render_image, gt_image)  # 计算L1 loss
             loss_gs = (1.0 - 0.2) * Ll1 + 0.2 * (1.0 - ssim(render_image, gt_image))
@@ -202,14 +230,20 @@ class ModelWrapperOverfit(LightningModule):
             loss_gs.backward()
         total_loss.backward()
 
-        if (self.global_step > iteration_gs) and (self.global_step <= 7000):     # 2000~7000次迭代，每200次迭代进行一次测试
-            if (self.global_step % 200 == 0):   # 0
+        # if (self.global_step > iteration_gs) and (self.global_step <= 3000):     # 2000~7000次迭代，每200次迭代进行一次测试
+        if (self.global_step > iteration_gs):
+            # if (self.global_step % 200 == 0):   # 200
+            if (self.global_step % 5000 == 0) or (self.global_step == 32000):
                 print("self.global_step: ", self.global_step)
                 point_cloud_path = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output",
                                                 "point_cloud/iteration_{}".format(self.global_step))
-                self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+                # self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+                self.gaussians.save_ply_xyz(os.path.join(point_cloud_path, "point_cloud.ply"), xyz_flowmap)
+                # viewpoint_stack = cameraList_from_camInfos(self.sceneinfo.train_cameras, resolution_scale=1, args=None)
                 viewpoint_stack = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale=1, args=None)
-                validation_configs = ({'name': 'test', 'cameras': []},
+                viewpoint_stack_test = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale=1, args=None)
+                # viewpoint_stack_test = cameraList_from_camInfos(self.sceneinfo.test_cameras, resolution_scale=1, args=None)
+                validation_configs = ({'name': 'test', 'cameras': viewpoint_stack_test},
                                       {'name': 'train', 'cameras': [viewpoint_stack[idx % len(viewpoint_stack)] for idx in
                                                                     range(5, 30, 5)]})  # 5, 10, 15, 20, 25
                 # 计算pnsr，并保存输出的render image
@@ -217,86 +251,109 @@ class ModelWrapperOverfit(LightningModule):
                     if config['cameras'] and len(config['cameras']) > 0:  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39   len(config['cameras'])==2
                         l1_test = 0.0
                         psnr_test = 0.0
+                        ssim_test = 0.0
+                        lpips_test = 0.0
                         for idx, viewpoint in enumerate(config['cameras']):  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39
-                             # Create a directory to save the rendered images
-                            rendered_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/rendered_images"
-                            os.makedirs(rendered_dir, exist_ok=True)
-
-                            # Create a directory to save the ground truth images
-                            gt_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/gt_images"
-                            os.makedirs(gt_dir, exist_ok=True)
-
-                            # Loop through the cameras and render the images
-                            image = render(viewpoint_cam, self.gaussians, xyz_flowmap, self.pipeline, self.background)[
-                                "render"]  # viewpoint: uid=0
-                            gt_image = viewpoint.original_image.to("cuda")
-
-                            # Save the rendered image
-                            vutils.save_image(image, os.path.join(rendered_dir, f"rendered_{idx}.png"), normalize=True)
-
-                            # Save the ground truth image
-                            vutils.save_image(gt_image, os.path.join(gt_dir, f"gt_{idx}.png"), normalize=True)
-
-                            image__ = torch.clamp(image, 0.0, 1.0)  # 将input的值限制在[min, max]之间
-                            gt_image__ = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                            l1_test += torch.abs((image__ - gt_image__)).mean().double()
-                            psnr_test += psnr(image__, gt_image__).mean().double()
-                        psnr_test /= len(config['cameras'])
-                        l1_test /= len(config['cameras'])
-                        with open("psnr_test.txt", "a") as file:
-                            file.write(f"[ITER {self.global_step}] Evaluating {config['name']}: PSNR {psnr_test}\n")
-                        print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(self.global_step, config['name'], l1_test,
-                                                                                psnr_test))
-        if self.global_step > 7000:               # 7000~30000w次迭代，每3000次迭代进行一次测试
-            if (self.global_step % 3000 == 0):  # 0
-                print("self.global_step: ", self.global_step)
-                point_cloud_path = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output",
-                                                "point_cloud/iteration_{}".format(self.global_step))
-                self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-                viewpoint_stack = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale=1,
-                                                           args=None)
-                validation_configs = ({'name': 'test', 'cameras': []},
-                                      {'name': 'train',
-                                       'cameras': [viewpoint_stack[idx % len(viewpoint_stack)] for idx in
-                                                   range(5, 30, 5)]})  # 5, 10, 15, 20, 25
-                # 计算pnsr，并保存输出的render image
-                for config in validation_configs:
-                    if config['cameras'] and len(config['cameras']) > 0:  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39   len(config['cameras'])==2
-                        l1_test = 0.0
-                        psnr_test = 0.0
-                        for idx, viewpoint in enumerate(
-                                config['cameras']):  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39
                             # Create a directory to save the rendered images
-                            rendered_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/rendered_images"
+                            rendered_dir = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output", config['name'], "rendered_images")
                             os.makedirs(rendered_dir, exist_ok=True)
 
                             # Create a directory to save the ground truth images
-                            gt_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/gt_images"
+                            gt_dir = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output", config['name'], "gt_images")
                             os.makedirs(gt_dir, exist_ok=True)
 
                             # Loop through the cameras and render the images
-                            image = render(viewpoint_cam, self.gaussians, xyz_flowmap, self.pipeline, self.background)[
-                                "render"]  # viewpoint: uid=0
+                            # image = render(viewpoint, self.gaussians, self.pipeline, self.background)["render"]  # viewpoint: uid=0
+                            image = render(viewpoint, self.gaussians, xyz_flowmap, self.pipeline, self.background)["render"]  # viewpoint: uid=0
                             gt_image = viewpoint.original_image.to("cuda")
 
                             # Save the rendered image
-                            vutils.save_image(image, os.path.join(rendered_dir, f"rendered_{idx}.png"),
-                                              normalize=True)
+                            # vutils.save_image(image, os.path.join(rendered_dir, f"{idx}.png"), normalize=True)
+                            vutils.save_image(image, os.path.join(rendered_dir, f"{idx}.png"))
 
                             # Save the ground truth image
-                            vutils.save_image(gt_image, os.path.join(gt_dir, f"gt_{idx}.png"), normalize=True)
+                            # vutils.save_image(gt_image, os.path.join(gt_dir, f"{idx}.png"), normalize=True)
+                            vutils.save_image(gt_image, os.path.join(gt_dir, f"{idx}.png"))
 
                             image__ = torch.clamp(image, 0.0, 1.0)  # 将input的值限制在[min, max]之间
-                            gt_image__ = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                            gt_image__ = torch.clamp(gt_image, 0.0, 1.0)
                             l1_test += torch.abs((image__ - gt_image__)).mean().double()
-                            psnr_test += psnr(image__, gt_image__).mean().double()
+                            # render_11 = Image.open("/data2/hkk/3dgs/flowmap/outputs/local/output/test/rendered_images/0.png")
+                            # gt_11 = Image.open("/data2/hkk/3dgs/flowmap/outputs/local/output/test/gt_images/0.png")
+                            # render_1122 = tf.to_tensor(render_11).unsqueeze(0)[:, :3, :, :].cuda()
+                            # gt_1122 = tf.to_tensor(gt_11).unsqueeze(0)[:, :3, :, :].cuda()
+                            # psnr_test_11 = psnr(render_1122, gt_1122).mean().double()
+                            # print("psnr_test_11: ", psnr_test_11)
+                            psnr_test += psnr(image__, gt_image__).mean().double()    # 12.9664
+                            # ssim_test += ssim(image__, gt_image__).mean().double()
+                            # lpips_test += lpips(image__, gt_image__, net_type='vgg').mean().double()
                         psnr_test /= len(config['cameras'])
+                        ssim_test /= len(config['cameras'])
+                        lpips_test /= len(config['cameras'])
                         l1_test /= len(config['cameras'])
                         with open("psnr_test.txt", "a") as file:
-                            file.write(f"[ITER {self.global_step}] Evaluating {config['name']}: PSNR {psnr_test}\n")
-                        print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(self.global_step, config['name'],
-                                                                                l1_test,
+                            file.write(f"[ITER {(self.global_step-2000)}] Evaluating {config['name']}: PSNR {psnr_test} SSIM {ssim_test} LPIPS {lpips_test}\n")
+                        print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format((self.global_step-2000), config['name'], l1_test,
                                                                                 psnr_test))
+        # if self.global_step > 3000:               # 7000~30000w次迭代，每3000次迭代进行一次测试
+        #     if (self.global_step % 5000 == 0) or (self.global_step == 32000):  # 0
+        #         print("self.global_step: ", self.global_step)
+        #         point_cloud_path = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output",
+        #                                         "point_cloud/iteration_{}".format(self.global_step))
+        #         # self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        #         self.gaussians.save_ply_xyz(os.path.join(point_cloud_path, "point_cloud.ply"), xyz_flowmap)
+        #         # viewpoint_stack = cameraList_from_camInfos(self.sceneinfo.train_cameras, resolution_scale=1, args=None)
+        #         viewpoint_stack = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale=1, args=None)
+        #         viewpoint_stack_test = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale=1, args=None)
+        #         # viewpoint_stack_test = cameraList_from_camInfos(self.sceneinfo.test_cameras, resolution_scale=1, args=None)
+        #         validation_configs = ({'name': 'test', 'cameras': viewpoint_stack_test},
+        #                               {'name': 'train',
+        #                                'cameras': [viewpoint_stack[idx % len(viewpoint_stack)] for idx in
+        #                                            range(5, 30, 5)]})  # 5, 10, 15, 20, 25
+        #         # 计算pnsr，并保存输出的render image
+        #         for config in validation_configs:
+        #             if config['cameras'] and len(config['cameras']) > 0:  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39   len(config['cameras'])==2
+        #                 l1_test = 0.0
+        #                 psnr_test = 0.0
+        #                 ssim_test = 0.0
+        #                 lpips_test = 0.0
+        #                 for idx, viewpoint in enumerate(config['cameras']):  # config['cameras'] 一共5个  image_name: 128, 6, 59, 51, 39
+        #                     # Create a directory to save the rendered images
+        #                     rendered_dir = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output", config['name'],
+        #                                                 "rendered_images")
+        #                     os.makedirs(rendered_dir, exist_ok=True)
+        #
+        #                     # Create a directory to save the ground truth images
+        #                     gt_dir = os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output", config['name'],
+        #                                           "gt_images")
+        #                     os.makedirs(gt_dir, exist_ok=True)
+        #
+        #                     # Loop through the cameras and render the images
+        #                     # image = render(viewpoint, self.gaussians, self.pipeline, self.background)["render"]  # viewpoint: uid=0
+        #                     image = render(viewpoint, self.gaussians, xyz_flowmap, self.pipeline, self.background)["render"]  # viewpoint: uid=0
+        #                     gt_image = viewpoint.original_image.to("cuda")
+        #
+        #                     # Save the rendered image
+        #                     vutils.save_image(image, os.path.join(rendered_dir, f"{idx}.png"))
+        #
+        #                     # Save the ground truth image
+        #                     vutils.save_image(gt_image, os.path.join(gt_dir, f"{idx}.png"))
+        #
+        #                     image__ = torch.clamp(image, 0.0, 1.0)  # 将input的值限制在[min, max]之间
+        #                     gt_image__ = torch.clamp(gt_image, 0.0, 1.0)
+        #                     l1_test += torch.abs((image__ - gt_image__)).mean().double()
+        #                     psnr_test += psnr(image__, gt_image__).mean().double()
+        #                     # ssim_test += ssim(image__, gt_image__).mean().double()
+        #                     # lpips_test += lpips(image__, gt_image__).mean().double()
+        #                 psnr_test /= len(config['cameras'])
+        #                 ssim_test /= len(config['cameras'])
+        #                 lpips_test /= len(config['cameras'])
+        #                 l1_test /= len(config['cameras'])
+        #                 with open("psnr_test.txt", "a") as file:
+        #                     file.write(
+        #                         f"[ITER {self.global_step}] Evaluating {config['name']}: PSNR {psnr_test} SSIM {ssim_test} LPIPS {lpips_test}\n")
+        #                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(self.global_step, config['name'], l1_test,
+        #                                                                         psnr_test))
         ### densification
 #         if self.global_step >= iteration_gs:
 #             with torch.no_grad():
@@ -348,7 +405,7 @@ class ModelWrapperOverfit(LightningModule):
         # Generate visualizations.
         for visualizer in self.visualizers:
             visualizations = visualizer.visualize(
-                self.batch,
+                self.batch,     # video [160,256]
                 self.flows,
                 self.tracks,
                 model_output,

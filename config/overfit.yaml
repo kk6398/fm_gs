@@ -12,7 +12,7 @@ defaults:                 # This is a placeholder configuration file for overfit
 
 wandb:
   project: flowmap
-  mode: online      # disabled  online
+  mode: disabled      # disabled  online
   name: placeholder
   group: null
   tags: null
@@ -23,7 +23,7 @@ checkpoint:
 
 trainer:
   val_check_interval: 50
-  max_steps: 30002       # 2000
+  max_steps: 32002       # 2000
 
   # 在此添加opt优化器的参数配置
   iterations: 30000
@@ -65,8 +65,8 @@ model_wrapper:
 cropping:
   # This can either be an exact shape like [180, 240] or an approximate number of
   # pixels. The default is as many pixels as 180*240.
-  image_shape: 43200
-  flow_scale_multiplier: 4
+  image_shape: 10800   # 43200
+  flow_scale_multiplier: 8    # 4
   patch_size: 32
 
 track_precomputation:

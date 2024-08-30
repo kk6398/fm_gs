@@ -39,7 +39,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))     # 1600，1200
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)  # 3x1200x1600      # 将original图像resize为裁剪尺寸，并读取
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)  # 3x1200x1600      # 将original图像resize为裁剪尺寸，并读取    # 1:418
 
     gt_image = resized_image_rgb[:3, ...]  # start被省略了，表示从数组的起始位置开始切片，stop被设置为3，表示切片结束位置为索引为2的元素（不包含在切片中），step也被省略了，表示使用默认的步长1。
     loaded_mask = None

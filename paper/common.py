@@ -8,10 +8,8 @@ from pathlib import Path
 import pandas as pd
 from jaxtyping import Float
 from torch import Tensor
-
 from flowmap.export.colmap import read_colmap_model
 from flowmap.misc.ate import compute_ate
-
 METRICS_PATH = Path("/mnt/sn850x/flowmap/metrics")
 RESULTS_PATH = Path("/mnt/sn850x/flowmap/results")
 METRICS_PREFIX = "paper_v17_"
@@ -166,10 +164,15 @@ def load_trajectory(method: Method, scene: Scene) -> Float[Tensor, "point 3"]:
     extrinsics, _, _ = read_colmap_model(path)
     return extrinsics[:, :3, 3]
 
+# METRICS = (
+#     METRIC_PSNR,
+#     METRIC_SSIM,
+#     METRIC_LPIPS,
+# )
 
 def load_metrics(
-    scenes: Iterable[Scene],
-    methods: Iterable[Method],
+    scenes: Iterable[Scene],         # SCENES = (*SCENES_LLFF, *SCENES_MIPNERF360, *SCENES_TANDT, *SCENES_CO3D)
+    methods: Iterable[Method],       # METHOD_FLOWMAP
     metrics: Iterable[Metric],
 ) -> pd.DataFrame:
     metrics = tuple(metrics)
@@ -236,3 +239,15 @@ def load_metrics(
                 data["metric_value"].append(scene_metrics.get(metric.tag, None))
 
     return pd.DataFrame(data)
+
+if __name__ == "__main__":
+    SCENES = (*SCENES_LLFF, *SCENES_MIPNERF360, *SCENES_TANDT, *SCENES_CO3D)
+    method = METHOD_FLOWMAP
+
+    METRICS = (
+        METRIC_PSNR,
+        METRIC_SSIM,
+        METRIC_LPIPS,
+    )
+
+    load_metrics(SCENES,method, METRICS)

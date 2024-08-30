@@ -86,7 +86,7 @@ def get_image_shape(
 ) -> tuple[int, int]:
     # If the image shape is exact, return it.
     if isinstance(cfg.image_shape, tuple):
-        return cfg.image_shape
+        return cfg.image_shape          # 43200
 
     # Otherwise, the image shape is assumed to be an approximate number of pixels.
     h, w = original_shape        # 3024, 4032
@@ -104,7 +104,7 @@ def crop_and_resize_batch_for_model(
 ) -> tuple[Batch, tuple[int, int]]:
     # Resize the batch to the desired model input size.           # [3, 3024, 4032]
     image_shape = get_image_shape(tuple(batch.videos.shape[-2:]), cfg)       # (180, 240)
-    batch = resize_batch(batch, image_shape)               # [1, 20, 3, 180, 240]
+    batch = resize_batch(batch, image_shape)               # 通过F.interpolate # [1, 20, 3, 180, 240]
 
     # print("batch: ", batch)
     # Record the pre-cropping shape.

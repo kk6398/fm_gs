@@ -61,11 +61,9 @@ with install_import_hook(
 from flowmap.scene import Scene, GaussianModel
 from flowmap.arguments import ModelParams
 # from .utils.loss_utils import l1_loss, ssim
-#
 # from .utils.image_utils import psnr
 # # from .arguments import ModelParams, PipelineParams, OptimizationParams
 # # import sys
-# # from .utils.general_utils import safe_state
 # from .scene.dataset_readers import readColmapSceneInfo
 # from .utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, camera_from_camInfos_selection
 # import random
@@ -83,6 +81,7 @@ def overfit(cfg_dict: DictConfig) -> None:
     cfg = get_typed_root_config(cfg_dict, OverfitCfg)  # 获取cfg配置 参数
     # print("cfg : ", cfg)
     print("cfg.dataset.root: ", cfg.dataset[0].root)  # /data2/hkk/datasets/flowmap/llff_fern
+
     # wandb=WandbCfg(project='flowmap', mode='disabled', name='placeholder', group=None, tags=None)
     # checkpoint=CheckpointCfg(every_n_train_steps=2000, load='checkpoints/initialization_finetuned.ckpt'),
     # trainer=TrainerCfg(val_check_interval=50, max_steps=2000),
@@ -109,10 +108,7 @@ def overfit(cfg_dict: DictConfig) -> None:
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")  # 将背景颜色转化为 PyTorch Tensor，并移到 GPU 上
     # gaussians.training_setup(cfg.trainer)
 
-    parser = ArgumentParser(description="cfg_args")
-    lp = ModelParams(parser)
-    args = parser.parse_args(sys.argv[1:])
-    lp.extract(args)
+
 
     callbacks, logger, checkpoint_path, output_dir = run_common_training_setup(
         # 获取回调函数(监控学习率的变化)、日志记录器、checkpoints路径、输出目录
@@ -123,13 +119,18 @@ def overfit(cfg_dict: DictConfig) -> None:
     colmap_path = output_dir / "colmap"
 
 
-
     # training_cfg = {"device": device, "eval": False, "images": 'images', "sh_degree": cfg.trainer.sh_degree,
     #                 "model_path": cfg.trainer.model_path, "white_background": cfg.trainer.white_background}
+    parser = ArgumentParser(description="cfg_args")
+    lp = ModelParams(parser)
+    args = parser.parse_args(sys.argv[1:])
+    lp.extract(args)
+    attrs_dict = vars(lp)
+    renamed_attrs = {k.lstrip('_'): v for k, v in attrs_dict.items() if '_' in k}
+    namespace_obj = Namespace(**renamed_attrs)
     os.makedirs(cfg.trainer.model_path, exist_ok=True)
     with open(os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output", "cfg_args"), 'w') as cfg_log_f:
-        # cfg_log_f.write(str(training_cfg))
-        cfg_log_f.write(str(Namespace(**vars(lp))))
+        cfg_log_f.write(str(Namespace(**vars(namespace_obj))))
 
     # Load the full-resolution batch.
     dataset = get_dataset(cfg.dataset, "train", cfg.frame_sampler)  # 获取数据集  # dataset:  <flowmap.dataset.dataset_merged.DatasetMerged object at 0x7fb2be2e2710>
@@ -145,15 +146,25 @@ def overfit(cfg_dict: DictConfig) -> None:
     # Compute optical flow and tracks.                      # batch_for_model: 裁剪后的batch、图像内参、videos
     batch_for_model, pre_crop = crop_and_resize_batch_for_model(batch,      # batch_for_model.videos  torch.Size([1, 20, 3, 160, 224])    # pre_crop:  (180, 240)
                                                                 cfg.cropping)  # 对batch进行裁剪和缩放  ###    pre_crop:裁剪后的H W
-
+    # 160x256    167x258         # 21600:96x192
     batch_for_flow = crop_and_resize_batch_for_flow(batch, cfg.cropping)  # 对batch进行裁剪和缩放， 针对光流  #  batch_for_flow.videos  torch.Size([1, 20, 3, 640, 896])
 
     _, f, _, h, w = batch_for_model.videos.shape  # 获取batch中的视频的帧数、高、宽
-    flows = compute_flows(batch_for_flow, (h, w), device, cfg.flow)  # 计算光流,  输入是裁剪之后的batch, 图像的高和宽， 设备， cfg.flow
+    torch.cuda.synchronize()
+    memory_usage = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert bytes to megabytes
+
+    print(f"GPU memory usage: {memory_usage:.2f} MB")
+    flows = compute_flows(batch_for_flow, (h, w), device, cfg.flow)  #16998   # 计算光流,  输入是裁剪之后的batch, 图像的高和宽， 设备， cfg.flow
+
+    # Measure GPU memory usage
+    torch.cuda.synchronize()
+    memory_usage = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert bytes to megabytes
+
+    print(f"GPU memory usage: {memory_usage:.2f} MB")
 
     # Only compute tracks if the tracking loss is enabled.
     if any([loss.name == "tracking" for loss in cfg.loss]):  # 如果损失函数中有tracking
-        tracks = compute_tracks(  # 计算tracks    # CoTracker V1
+        tracks = compute_tracks(  # 12062   计算tracks    # CoTracker V1
             batch_for_flow, device, cfg.tracking, cfg.track_precomputation
         )
     else:

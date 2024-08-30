@@ -258,17 +258,60 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     return scene_info
 
 
+def readSceneInfo(extrinsics, intrinsics, path, eval=False, llffhold=2, num_images=-1):  # llffhold=8
+
+    # reading_dir = "images" if images == None else images
+    cam_infos_unsorted = readFlowmapCameras(cam_extrinsics=extrinsics, cam_intrinsics=intrinsics, images_folder=path)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    if eval and num_images <= 0:
+        # Follow llffhold pattern to split train/test
+        # But modify to swap train/test splits
+        # We use this split pattern in certain scenes.
+        # But metric-wise, using `num_images` should
+        # produce similar metrics.
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+    elif eval and num_images > 0:
+        # Use num_images to specify train/test split
+        from math import floor  # 返回小于参数x的最大整数,即对浮点数向下取整
+        length = len(cam_infos)  # tt_family: 200
+        interval = floor((length - num_images) / (num_images - 1))  # (200-3)/(3-1)=98      (200-12)/(12-1)=17
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % (interval + 1) == 0]  # 0, 99, 198      0, 18, 36, 54, 72, 90, 108, 126, 144, 162, 180, 198
+        train_cam_infos[-1] = cam_infos[-1]  # Ensure last frame is covered
+        assert len(train_cam_infos) == num_images
+        train_cam_image_name_s = {c.image_name: 1 for c in train_cam_infos}
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if not (c.image_name in train_cam_image_name_s)]  # residual cam_infos
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)  # 计算所有相机的中心点位置, 以及它到最远camera的距离
+
+    scene_info = SceneInfo(point_cloud=None,
+                           # None   # 3dgs是根据读取的colmap点云生成 feature, scale, rots, opacities参数； 而此代码是通过open3d根据内外参和深度生成的点云
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,  # nerf_normalization=nerf_normalization
+                           ply_path=None)  # None
+    return scene_info
 
 # def readFlowmapSceneInfo(path, images, eval, llffhold=8):
-def readFlowmapSceneInfo(extrinsics, intrinsics, path, eval=False, llffhold=8):
+def readFlowmapSceneInfo(extrinsics, intrinsics, path, eval=False, llffhold=2):     # llffhold=8
     
     # reading_dir = "images" if images == None else images
     cam_infos_unsorted = readFlowmapCameras(cam_extrinsics=extrinsics, cam_intrinsics=intrinsics, images_folder=path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+        if len(cam_infos) == 15:
+            train_cam_infos = [cam_infos[0], cam_infos[len(cam_infos) // 2], cam_infos[-1]]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx not in [0, len(cam_infos) // 2, len(cam_infos) - 1]]
+        elif len(cam_infos) == 18:
+            None
+        elif len(cam_infos) == 24:
+            train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+            test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []

@@ -6,5 +6,10 @@ llff:
 
   # Dataset-specific configuration items
 #  root: /data2/hkk/datasets/flowmap/llff_fern
-  root: /data2/hkk/3dgs/flowmap/data/llff_fern
+#  root: /data2/hkk/datasets/mipnerf360/garden/24_views/images
+#  root: /data2/hkk/datasets/instantsplat/collated_instantsplat_data/eval/Tanks/Family/24_views/images
+#  root: /data2/hkk/3dgs/InstantSplat/data/TT/Family/3_views/train+test
+#  root: /data2/hkk/3dgs/COGS/dataset/Tanks/Family/images
+  root: /data2/hkk/3dgs/COGS/dataset/Tanks/Family
+#  root: /data2/hkk/3dgs/COGS/dataset/Tanks/Horse/images
 #  root: D:\git\flowmap\data\llff_fern

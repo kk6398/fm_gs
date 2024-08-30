@@ -96,19 +96,52 @@ def save_json(scene_info):
         camlist.extend(scene_info.train_cameras)
     for id, cam in enumerate(camlist):  # cam: CameraInfo
         json_cams.append(camera_to_JSON(id, cam))
-    with open(os.path.join("/data2/hkk/3dgs/flowmap/outputs/local/output/", "cameras.json"), 'w') as file:
+    output_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/"
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "cameras.json"), 'w') as file:
         json.dump(json_cams, file)
 
 
-def xyz_from_flowmap(depths, intrinsics, extrinsics, batch):
+def xyz_from_flowmap(depths, intrinsics, extrinsics, batch, num_images=-1):
     _, _, dh, dw = depths.shape  # ([1, 20, 160, 224])
     xy, _ = sample_image_grid((dh, dw), extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
-    bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
-        extrinsics[0],  # torch.Size ([20, 3, 3])
-        intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
-        depths[0],  # ([20, 160, 224])
-        batch.videos[0],  # ([20, 3, 160, 224])
-    )
+    if num_images == -1:
+        bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+            extrinsics[0],  # torch.Size ([20, 3, 3])
+            intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+            depths[0],  # ([20, 160, 224])
+            batch.videos[0],  # ([20, 3, 160, 224])
+        )
+    else:
+        from math import floor
+        train_view = []
+        length = depths.shape[1]
+        interval = floor((length - num_images) / (num_images - 1))
+        for i in range(0, length):
+            if i % (interval + 1) == 0:
+                train_view.append(i)
+        train_view[-1] = length - 1  # 强制让最后一个值为总数200
+        # 提取batch, depths, intrinsics, extrinsics 的train_view
+        batch_fewshot = []
+        depth_fewshot = []
+        intrinsics_fewshot = []
+        extrinsics_fewshot = []
+        for i in train_view:
+            batch_fewshot.append(batch.videos[:, i])  # batch.videos: [1, 200, 3, xxx, xxx]
+            depth_fewshot.append(depths[:, i])
+            intrinsics_fewshot.append(intrinsics[:, i])
+            extrinsics_fewshot.append(extrinsics[:, i])
+        batch_fewshot = torch.cat(batch_fewshot, dim=0)
+        depth_fewshot = torch.cat(depth_fewshot, dim=0)
+        intrinsics_fewshot = torch.cat(intrinsics_fewshot, dim=0)
+        extrinsics_fewshot = torch.cat(extrinsics_fewshot, dim=0)
+        bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+            extrinsics_fewshot,  # torch.Size ([20, 3, 3])
+            intrinsics_fewshot,  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+            depth_fewshot,  # ([20, 160, 224])
+            batch_fewshot,  # ([20, 3, 160, 224])
+        )
+
     points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
     # colors = []
     for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。

@@ -14,6 +14,7 @@ import numpy as np
 from ..utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
+from math import floor
 from ..utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from ..utils.sh_utils import RGB2SH
@@ -200,6 +201,103 @@ class GaussianModel:
             intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
             depths[0],  # ([20, 160, 224])
             batch.videos[0],  # ([20, 3, 160, 224])
+            # batch[0],  # ([20, 3, 160, 224])
+        )
+        points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
+        colors = []
+        for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。
+            xyz = unproject(xy, depths, intrinsics)  # 使用unproject函数将图像坐标和深度值转换为3D空间中的点(相机坐标系)
+            xyz = homogenize_points(xyz)  # 将3D点同质化，即增加一个维度以便于矩阵乘法。
+            xyz = einsum(extrinsics, xyz, "i j, ... j -> ... i")[..., :3]  # 将外参矩阵与同质化的3D点相乘，得到世界坐标系中的3D点，并去除同质化的维度。
+            points.append(rearrange(xyz, "h w xyz -> (h w) xyz").detach().cpu().numpy())  # 将转换后的3D点和颜色分别添加到对应的列表中
+            colors.append(rearrange(rgb, "c h w -> (h w) c").detach().cpu().numpy())
+        points = np.concatenate(points)  # 将所有3D点和颜色合并成一个NumPy数组
+        colors = np.concatenate(colors)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        o3d.io.write_point_cloud("/data2/hkk/3dgs/flowmap/outputs/local/output/input.ply", pcd)
+
+        # 将点云的点坐标转换为 PyTorch 张量，并移到GPU上。
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()  # [716800,3]
+        # 将点云的颜色信息转换为 PyTorch 张量，然后再转成sh系数，并移到GPU上。
+        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())  # [716800,3]
+        # 初始化点云的特征表示。
+        features = (  # # [716800,3,16] # *size   [a, b, c]
+            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))  # max_sh_degree 3或0
+            .float()
+            .cuda()
+        )
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        # 根据点与相机之间的距离计算尺度。 #####################
+        dist2 = (
+            torch.clamp_min(
+                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+                0.0000001,
+            )
+            # * point_size    # point_size: 0.01
+        )
+        # scales = torch.log(torch.sqrt(dist2))[..., None]
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)  # [716800,3]
+
+        # 初始化旋转矩阵。
+        rots = torch.zeros((fused_point_cloud.shape[0], 4),
+                           device="cuda")  # # [716800,4]# 大小为fused_point_cloud.shape[0]行、4列的零矩阵
+        rots[:, 0] = 1
+        # 初始化不透明度。
+        opacities = inverse_sigmoid(  # # [716800,1]
+            0.1  # original gs: 0.1   # gs slam: 0.5
+            * torch.ones(
+                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
+            )
+        )
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))  # 位置
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))  # 球谐系数C0项
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))  # 其余球谐系数
+        self._scaling = nn.Parameter(scales.requires_grad_(True))  # 尺度
+        self._rotation = nn.Parameter(rots.requires_grad_(True))  # 旋转
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))  # 不透明度
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+
+    def create_fewshot_gaussian_params(self, intrinsics, extrinsics, depths, batch, spatial_lr_scale, num_images):
+        self.spatial_lr_scale = spatial_lr_scale     # 0.088
+        train_view = []
+        length = depths.shape[1]
+        interval = floor((length - num_images) / (num_images - 1))
+        for i in range(0, length):
+            if i % (interval + 1) == 0:
+                train_view.append(i)
+        train_view[-1] = length - 1     # 强制让最后一个值为总数200
+        # 提取batch, depths, intrinsics, extrinsics 的train_view
+        batch_fewshot = []
+        depth_fewshot = []
+        intrinsics_fewshot = []
+        extrinsics_fewshot = []
+        for i in train_view:
+            batch_fewshot.append(batch.videos[:, i])        # batch.videos: [1, 200, 3, xxx, xxx]
+            depth_fewshot.append(depths[:, i])
+            intrinsics_fewshot.append(intrinsics[:, i])
+            extrinsics_fewshot.append(extrinsics[:, i])
+        batch_fewshot = torch.cat(batch_fewshot, dim=0)
+        depth_fewshot = torch.cat(depth_fewshot, dim=0)
+        intrinsics_fewshot = torch.cat(intrinsics_fewshot, dim=0)
+        extrinsics_fewshot = torch.cat(extrinsics_fewshot, dim=0)
+
+        _, _, dh, dw = depths.shape  # ([1, 20, 160, 224])
+        xy, _ = sample_image_grid((dh, dw), extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
+        bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+            extrinsics_fewshot,  # torch.Size ([20, 4, 4])
+            intrinsics_fewshot,  # torch.Size([20, 3, 3])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+            depth_fewshot,  # ([20, 160, 224])
+            batch_fewshot,  # ([20, 3, 160, 224])
         )
         points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
         colors = []
@@ -443,6 +541,25 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
+    def save_ply_xyz(self, path, xyz_flowmap):
+        mkdir_p(os.path.dirname(path))
+
+        xyz = xyz_flowmap.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
