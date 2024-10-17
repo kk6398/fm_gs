@@ -199,6 +199,154 @@ def export_to_colmap(
         shutil.copy(frame_path, path / "images" / frame_path.name)
 
 
+def export_to_colmap_intr(
+        exports: ModelExports,  # 外参、内参、颜色、深度
+        intrinsics: Float[Tensor, "batch frame 3 3"],
+        frame_paths: list[Path],  # 帧路径
+        uncropped_exports_shape: tuple[int, int],
+        uncropped_videos: Float[Tensor, "batch frame 3 uncropped_height uncropped_width"],
+        path: Path,
+) -> None:
+    # Account for the cropping that FlowMap does during optimization.
+    _, _, h_cropped, w_cropped = exports.depths.shape  # 160  224
+    # print("-------------------------")
+    # print('exports.depths.shape:',exports.depths.shape)  #      ([1, 20, 160, 224])
+    # print('exports.intrinsics.shape:',exports.intrinsics.shape)  #   ([1, 20, 3, 3])
+    # print('exports.extrinsics.shape:',exports.extrinsics.shape)  #   ([1, 20, 4, 4])
+    # print('exports.colors.shape:',exports.colors.shape)  #   ([1, 20, 3, 160, 224])
+
+    h_uncropped, w_uncropped = uncropped_exports_shape  # 180 240
+    # print('uncropped_exports_shape', uncropped_exports_shape)  #   应该与pre_crop_shape一致    (180, 240)
+
+    intrinsics = center_crop_intrinsics(
+        intrinsics,
+        (h_cropped, w_cropped),  # 160  224
+        (h_uncropped, w_uncropped),  # (180, 240)
+    )
+    # print("-------------------------")
+    # print('crop_intrinsics  exports.intrinsics.shape:', intrinsics.shape)  #  ([1, 20, 3, 3])  # 待定：尺度没变，值乘相应倍数
+
+    # Write out the camera parameters.      输出图像对应的内参、外参，为colmap做准备
+    sparse_path = path / "sparse/0"
+    # print('sparse_path:',sparse_path)  #  outputs/local/colmap/sparse/0
+
+    _, _, _, h_full, w_full = uncropped_videos.shape  # 原视频帧的尺度
+    # print('uncropped_videos.shape:',uncropped_videos.shape)  #   torch.Size([1, 20, 3, 3024, 4032])
+
+    write_colmap_model(  # 输出 cameras、 images.text/.bin文件
+        sparse_path,
+        exports.extrinsics[0],
+        intrinsics[0],
+        [path.name for path in frame_paths],
+        (h_full, w_full),  # [3024, 4032]
+    )
+
+    # Define the point cloud. For compatibility with 3D Gaussian Splatting, this is
+    # stored as a .ply instead of Points3D, which seems to be intended for a much
+    # smaller number of points.
+    _, _, dh, dw = exports.depths.shape  # ([1, 20, 160, 224])
+    xy, _ = sample_image_grid((dh, dw), exports.extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
+    bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+        exports.extrinsics[0],  # torch.Size ([20, 3, 3])
+        intrinsics[0],  # torch.Size([20, 4, 4])
+        exports.depths[0],  # ([20, 160, 224])
+        exports.colors[0],  # ([20, 3, 160, 224])
+    )
+    points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
+    colors = []
+    for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。
+        xyz = unproject(xy, depths, intrinsics)  # 使用unproject函数将图像坐标和深度值转换为3D空间中的点(相机坐标系)
+        xyz = homogenize_points(xyz)  # 将3D点同质化，即增加一个维度以便于矩阵乘法。
+        xyz = einsum(extrinsics, xyz, "i j, ... j -> ... i")[..., :3]  # 将外参矩阵与同质化的3D点相乘，得到世界坐标系中的3D点，并去除同质化的维度。
+        points.append(rearrange(xyz, "h w xyz -> (h w) xyz").detach().cpu().numpy())  # 将转换后的3D点和颜色分别添加到对应的列表中
+        colors.append(rearrange(rgb, "c h w -> (h w) c").detach().cpu().numpy())
+    points = np.concatenate(points)  # 将所有3D点和颜色合并成一个NumPy数组
+    colors = np.concatenate(colors)
+
+    sparse_path.mkdir(parents=True, exist_ok=True)
+    write_ply(sparse_path / "points3D.ply", points, colors)  # 使用write_ply函数(from 3dgs)将3D点和颜色写入.ply文件
+
+    # Write out the images.
+    (path / "images").mkdir(exist_ok=True, parents=True)
+    for frame_path in frame_paths:
+        shutil.copy(frame_path, path / "images" / frame_path.name)
+
+
+def export_to_colmap_gs(
+        exports: ModelExports,  # 外参、内参、颜色、深度
+        intrinsics: Float[Tensor, "batch frame 3 3"],
+        extrinsics: Float[Tensor, "batch frame 4 4"],
+        frame_paths: list[Path],  # 帧路径
+        uncropped_exports_shape: tuple[int, int],
+        uncropped_videos: Float[Tensor, "batch frame 3 uncropped_height uncropped_width"],
+        path: Path,
+) -> None:
+    # Account for the cropping that FlowMap does during optimization.
+    _, _, h_cropped, w_cropped = exports.depths.shape  # 160  224
+    # print("-------------------------")
+    # print('exports.depths.shape:',exports.depths.shape)  #      ([1, 20, 160, 224])
+    # print('exports.intrinsics.shape:',exports.intrinsics.shape)  #   ([1, 20, 3, 3])
+    # print('exports.extrinsics.shape:',exports.extrinsics.shape)  #   ([1, 20, 4, 4])
+    # print('exports.colors.shape:',exports.colors.shape)  #   ([1, 20, 3, 160, 224])
+
+    h_uncropped, w_uncropped = uncropped_exports_shape  # 180 240
+    # print('uncropped_exports_shape', uncropped_exports_shape)  #   应该与pre_crop_shape一致    (180, 240)
+
+    intrinsics = center_crop_intrinsics(
+        intrinsics,
+        # exports.intrinsics,
+        (h_cropped, w_cropped),  # 160  224
+        (h_uncropped, w_uncropped),  # (180, 240)
+    )
+    # print("-------------------------")
+    # print('crop_intrinsics  exports.intrinsics.shape:', intrinsics.shape)  #  ([1, 20, 3, 3])  # 待定：尺度没变，值乘相应倍数
+
+    # Write out the camera parameters.      输出图像对应的内参、外参，为colmap做准备
+    sparse_path = path / "sparse/0"
+    # print('sparse_path:',sparse_path)  #  outputs/local/colmap/sparse/0
+
+    _, _, _, h_full, w_full = uncropped_videos.shape  # 原视频帧的尺度
+    # print('uncropped_videos.shape:',uncropped_videos.shape)  #   torch.Size([1, 20, 3, 3024, 4032])
+
+    write_colmap_model(  # 输出 cameras、 images.text/.bin文件
+        sparse_path,
+        extrinsics[0],
+        intrinsics[0],
+        [path.name for path in frame_paths],
+        (h_full, w_full),  # [3024, 4032]
+    )
+
+    # Define the point cloud. For compatibility with 3D Gaussian Splatting, this is
+    # stored as a .ply instead of Points3D, which seems to be intended for a much
+    # smaller number of points.
+    _, _, dh, dw = exports.depths.shape  # ([1, 20, 160, 224])
+    xy, _ = sample_image_grid((dh, dw), exports.extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
+    bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+        extrinsics[0],  # torch.Size ([20, 3, 3])
+        intrinsics[0],  # torch.Size([20, 4, 4])
+        # exports.intrinsics[0],  # torch.Size([20, 4, 4])
+        exports.depths[0],  # ([20, 160, 224])
+        exports.colors[0],  # ([20, 3, 160, 224])
+    )
+    points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
+    colors = []
+    for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。
+        xyz = unproject(xy, depths, intrinsics)  # 使用unproject函数将图像坐标和深度值转换为3D空间中的点(相机坐标系)
+        xyz = homogenize_points(xyz)  # 将3D点同质化，即增加一个维度以便于矩阵乘法。
+        xyz = einsum(extrinsics, xyz, "i j, ... j -> ... i")[..., :3]  # 将外参矩阵与同质化的3D点相乘，得到世界坐标系中的3D点，并去除同质化的维度。
+        points.append(rearrange(xyz, "h w xyz -> (h w) xyz").detach().cpu().numpy())  # 将转换后的3D点和颜色分别添加到对应的列表中
+        colors.append(rearrange(rgb, "c h w -> (h w) c").detach().cpu().numpy())
+    points = np.concatenate(points)  # 将所有3D点和颜色合并成一个NumPy数组
+    colors = np.concatenate(colors)
+
+    sparse_path.mkdir(parents=True, exist_ok=True)
+    write_ply(sparse_path / "points3D.ply", points, colors)  # 使用write_ply函数(from 3dgs)将3D点和颜色写入.ply文件
+
+    # Write out the images.
+    (path / "images").mkdir(exist_ok=True, parents=True)
+    for frame_path in frame_paths:
+        shutil.copy(frame_path, path / "images" / frame_path.name)
+
 def read_colmap_model(
     path: Path,
     device: torch.device = torch.device("cpu"),
@@ -306,14 +454,20 @@ def write_colmap_model(
         
         id = index + 1                                     
 
+        ## for extrinsic_gs
+        # qvec = matrix_to_quaternion(c2w[:3, :3])
+        # tvec = c2w[:3, 3]
+
+
         # Convert the extrinsics to COLMAP's format.
         w2c = c2w.inverse().detach().cpu().numpy()                # 从世界坐标到相机坐标的转换
         # R.from_matrix方法从3x3旋转矩阵中获取四元数表示，然后使用as_quat方法将其转换为四元数形式（qw, qx, qy, qz）
         qx, qy, qz, qw = R.from_matrix(w2c[:3, :3]).as_quat()     # R: Rotation
-        qvec = np.array((qw, qx, qy, qz))                         # 转换成数组
-        tvec = w2c[:3, 3]                                         # 提取平移向量，即从世界坐标到相机坐标的转换矩阵的最后列
-        images[id] = Image(id, qvec, tvec, id, name, [], [])
 
+        qvec = np.array((qw, qx, qy, qz))  # 转换成数组
+        tvec = w2c[:3, 3]
+        images[id] = Image(id, qvec, tvec, id, name, [], [])
+    print("images:", images)
     path.mkdir(exist_ok=True, parents=True)
     write_model(cameras, images, None, path)           # 将相机参数、图像数据和3D点云数据写入，形成 cameras、 images.text/.bin文件
     

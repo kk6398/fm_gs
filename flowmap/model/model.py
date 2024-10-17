@@ -57,6 +57,7 @@ class Model(nn.Module):
                                      image_shape)  # 输出深度和对应权重 backbone = BackboneOverfit(backbone_cfg, num_frames, image_shape)
         self.intrinsics = get_intrinsics(cfg.intrinsics)  # 输出内参
         self.extrinsics = get_extrinsics(cfg.extrinsics, num_frames)  # 输出外参
+        # self.extrinsics_gt = batch.extrinsics      # 需要将testing frame 初始化为最近邻 training frame的pose
 
     def forward(
             self,
@@ -66,7 +67,7 @@ class Model(nn.Module):
 
     ) -> ModelOutput:
         device = batch.videos.device
-        _, _, _, h, w = batch.videos.shape
+        _, _, _, h, w = batch.videos.shape    # [3,128,64]
 
         ### setp1. flowmap outputs depth, intrinsics, extrinsics
         # Run the backbone, which provides depths and correspondence weights.
@@ -86,7 +87,11 @@ class Model(nn.Module):
             rearrange(intrinsics, "b f i j -> b f () () i j"),
         )
         # Finally, compute the extrinsics.
-        extrinsics = self.extrinsics.forward(batch, flows, backbone_out, surfaces)
+        if global_step==0 and (batch.extrinsics)!=None:      # 可以判断self.extrinsics_gt是不是空的
+            extrinsics = batch.extrinsics   # training帧数few-shot 3/6/12, 需要将testing frame 初始化为最近邻 training frame的extrinsics
+
+        else:
+            extrinsics = self.extrinsics.forward(batch, flows, backbone_out, surfaces)
 
 
         return ModelOutput(

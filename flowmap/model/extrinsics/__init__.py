@@ -5,6 +5,7 @@ from .extrinsics_regressed import ExtrinsicsRegressed, ExtrinsicsRegressedCfg
 EXTRINSICS = {
     "procrustes": ExtrinsicsProcrustes,
     "regressed": ExtrinsicsRegressed,
+    # "ground_truth": ExtrinsicsGroundTruth,
 }
 
 ExtrinsicsCfg = ExtrinsicsProcrustesCfg | ExtrinsicsRegressedCfg

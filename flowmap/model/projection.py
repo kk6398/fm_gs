@@ -81,13 +81,13 @@ def unproject(
     """Unproject 2D camera coordinates with the given Z values."""
 
     # Apply the inverse intrinsics to the coordinates.
-    coordinates = homogenize_points(coordinates)
+    coordinates = homogenize_points(coordinates)         # [H,W,2] → [H,W,3]
     ray_directions = einsum(
-        intrinsics.inverse(), coordinates, "... i j, ... j -> ... i"
+        intrinsics.inverse(), coordinates, "... i j, ... j -> ... i"       # einsum: 根据后面陈述的规则，进行矩阵计算
     )
 
     # Apply the supplied depth values.
-    return ray_directions * z[..., None]
+    return ray_directions * z[..., None]       # z是深度
 
 
 def sample_image_grid(

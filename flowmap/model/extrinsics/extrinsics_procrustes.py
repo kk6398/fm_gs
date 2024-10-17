@@ -31,7 +31,7 @@ class ExtrinsicsProcrustes(Extrinsics[ExtrinsicsProcrustesCfg]):
         _, _, h, w, _ = surfaces.shape
 
         # Select the subset of points used for the alignment.
-        if self.cfg.num_points is None:
+        if self.cfg.num_points is None:        # flowcam 随机选择了1000个点
             indices = torch.arange(h * w, dtype=torch.int64, device=device)
         elif self.cfg.randomize_points:
             indices = torch.randint(
@@ -41,7 +41,7 @@ class ExtrinsicsProcrustes(Extrinsics[ExtrinsicsProcrustesCfg]):
                 dtype=torch.int64,
                 device=device,
             )
-        else:
+        else:                            #flowmap是从整个图形均匀采样1000个点
             indices = torch.linspace(
                 0,
                 h * w - 1,

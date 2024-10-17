@@ -68,13 +68,13 @@ class IntrinsicsSoftmin(Intrinsics[IntrinsicsSoftminCfg]):
         global_step: int,
     ) -> Float[Tensor, "batch frame 3 3"]:
         b, f, _, h, w = batch.videos.shape
-        n = self.cfg.num_candidates
+        n = self.cfg.num_candidates      # num_candidates=60
         device = batch.videos.device
 
         # Handle the second stage (in which the intrinsics are regressed).
         if (
             self.cfg.regression is not None
-            and global_step >= self.cfg.regression.after_step
+            and global_step >= self.cfg.regression.after_step      # 1000
         ):
             if global_step == self.cfg.regression.after_step:
                 initial_value = torch.stack(self.window).mean()
@@ -83,7 +83,7 @@ class IntrinsicsSoftmin(Intrinsics[IntrinsicsSoftminCfg]):
 
         # Convert the candidate focal lengths into 3x3 intrinsics matrices.
         candidate_intrinsics = focal_lengths_to_intrinsics(
-            self.focal_length_candidates, (h, w)
+            self.focal_length_candidates, (h, w)          # 0.500~2.000, 均匀采样60个值
         )
 
         # Align the first two frames with all possible intrinsics.
@@ -95,7 +95,7 @@ class IntrinsicsSoftmin(Intrinsics[IntrinsicsSoftminCfg]):
             repeat(candidate_intrinsics, "n i j -> (b n) f () () i j", b=b, f=2),
         )
         extrinsics = align_surfaces(
-            surfaces,
+            surfaces,   # [60, 2, H, W, 3]
             repeat(flows.backward[:, :1], "b f h w xy -> (b n) f h w xy", n=n),
             repeat(backbone_output.weights[:, :1], "b f h w -> (b n) f h w", n=n),
             indices,
@@ -115,14 +115,14 @@ class IntrinsicsSoftmin(Intrinsics[IntrinsicsSoftminCfg]):
         flow = xy_flowed_backward - xy
 
         # Sample from the ground-truth flow and backward correspondence weights.
-        flow_gt = rearrange(flows.backward[:, :1], "b () h w xy -> b () (h w) xy")
+        flow_gt = rearrange(flows.backward[:, :1], "b () h w xy -> b () (h w) xy")   # 为什么反向光流为gt
         flow_gt = flow_gt[:, :, indices]
         weights = rearrange(backbone_output.weights[:, :1], "b () h w -> b () (h w) ()")
         weights = weights[:, :, indices]
 
         # Compute flow error for each of the candidate intrinsics.
-        error = ((flow - flow_gt) * weights).abs()
-        error = reduce(error, "b n p xy -> b n", "sum")
+        error = ((flow - flow_gt) * weights).abs()       # flow: [1,60,8192,2]    flow_gt: [1,1,8192,2]    weights: [1,1,8192,2]
+        error = reduce(error, "b n p xy -> b n", "sum")  # [1,60,8192,2]  →  [1,60]
 
         # Compute a softmin-weighted sum of candidates.
         weights = (error - error.min(dim=1, keepdim=True).values) * 10

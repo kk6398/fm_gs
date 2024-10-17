@@ -17,3 +17,4 @@ class Batch(Manipulable):
     datasets: list[str]
     extrinsics: Float[Tensor, "batch frame 4 4"] | None = None
     intrinsics: Float[Tensor, "batch frame 3 3"] | None = None
+    # intrinsics: Float[Tensor, "batch frame 3 3"]

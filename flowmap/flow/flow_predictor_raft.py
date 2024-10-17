@@ -31,7 +31,7 @@ class FlowPredictorRaft(FlowPredictor[FlowPredictorRaftCfg]):
         videos: Float[Tensor, "batch frame 3 height width"],
     ) -> Float[Tensor, "batch frame-1 height width 2"]:
         source, target, b, f = split_videos(videos)
-
+        #  source: [2,3,256,512]   target: [2,3,256,512]，得到forward\backward的两组图像          source: [199,3,256,512]   target: [199,3,256,512]
         # RAFT seems to be unhappy with large batch sizes.
         bar = (
             partial(tqdm, desc="Computing RAFT flow")
@@ -40,7 +40,7 @@ class FlowPredictorRaft(FlowPredictor[FlowPredictorRaftCfg]):
         )
         flow = [
             self.raft(
-                source_chunk * 2 - 1,
+                source_chunk * 2 - 1,      # 200: [8,3,256,512]
                 target_chunk * 2 - 1,
                 num_flow_updates=self.cfg.num_flow_updates,
             )[-1]

@@ -52,40 +52,48 @@ class BackboneMidas(Backbone[BackboneMidasCfg]):
             cfg.model,
             pretrained=cfg.pretrained,
         )
+        # self.midas_original = torch.hub.load(
+        #     "intel-isl/MiDaS",
+        #     cfg.model,
+        #     pretrained=cfg.pretrained,
+        # )
+        # self.midas_original = self.midas
         self.midas_out = self.midas.scratch.output_conv
         self.midas.scratch.output_conv = nn.Identity()
 
         # If a weight sensitivity is specified, don't learn weights.
-        if cfg.weight_sensitivity is None:
+        if cfg.weight_sensitivity is None:    # None
             weight_channels = {
                 "DPT_Large": 256,
-                "MiDaS_small": 64,
+                "MiDaS_small": 64,       # MiDaS_small
             }[cfg.model]
             self.corr_weighter_perpoint = make_net([weight_channels * 2, 128, 64, 1])
         else:
             weights = torch.full((num_frames - 1, *image_shape), 0, dtype=torch.float32)
             self.weights = nn.Parameter(weights)
 
-        if cfg.mapping == "exp":
+        if cfg.mapping == "exp":     # original
             self.midas_out = nn.Sequential(*self.midas_out[:-2])
 
     def forward(self, batch: Batch, flows: Flows) -> BackboneOutput:
         device = batch.videos.device
-        b, f, _, h, w = batch.videos.shape
+        b, f, _, h, w = batch.videos.shape   # 1  200  3  64   128
 
-        videos = rearrange(batch.videos, "b f c h w -> (b f) c h w")
-        features = self.midas(videos)
+        videos = rearrange(batch.videos, "b f c h w -> (b f) c h w")    # videos: B, N, C, H W  [1, 12, 3, 64, 128]
+        features = self.midas(videos)         # 利用单目深度估计方法midas    # [12 64 32 64]
 
         # This matches Cameron's original implementation.
-        match self.cfg.mapping:
+        match self.cfg.mapping:     # original
             case "original":
-                depths = 1e3 / (self.midas_out(features) + 0.1)
+                depths = 1e3 / (self.midas_out(features) + 0.1)      # depths: [12, 1, 64, 128]
+                # depths_original = 1e3 / (self.midas_original(videos) + 0.1)      # depths: [12, 1, 64, 128]
             case "exp":
                 depths = (self.midas_out(features) / 1000).exp() + 0.01
 
         features = F.interpolate(features, (h, w), mode="bilinear") / 20
 
-        depths = rearrange(depths, "(b f) () h w -> b f h w", b=b, f=f)
+        depths = rearrange(depths, "(b f) () h w -> b f h w", b=b, f=f)     # [1, 12, 64, 128]
+        # depths_original = rearrange(depths_original, 'b h w -> (1 b) h w')
         features = rearrange(features, "(b f) c h w -> b f c h w", b=b, f=f)
 
         # Compute correspondence weights.
@@ -93,7 +101,7 @@ class BackboneMidas(Backbone[BackboneMidasCfg]):
             xy, _ = sample_image_grid((h, w), device)
             backward_weights = self.compute_correspondence_weights(
                 self.grid_sample_features(earlier(features), xy + flows.backward),
-                later(features),
+                later(features),                          # backward_weights:    [1, 11, 64, 128]
             )
         else:
             backward_weights = (self.cfg.weight_sensitivity * self.weights).sigmoid()

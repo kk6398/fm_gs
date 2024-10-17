@@ -7,6 +7,7 @@ from .dataset_images import DatasetImages, DatasetImagesCfg
 from .dataset_llff import DatasetLLFF, DatasetLLFFCfg
 from .dataset_merged import DatasetMerged
 from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
+from .dataset_intrinsic_gt import DatasetIntrinsicGT, DatasetIntrinsicGTCfg
 from .types import Stage
 
 DATASETS = {
@@ -15,6 +16,7 @@ DATASETS = {
     "images": DatasetImages,
     "llff": DatasetLLFF,
     "re10k": DatasetRE10k,
+    "intrinsicgt": DatasetIntrinsicGT,
 }
 
 DatasetCfg = (
@@ -23,6 +25,7 @@ DatasetCfg = (
     | DatasetImagesCfg
     | DatasetLLFFCfg
     | DatasetRE10kCfg
+    | DatasetIntrinsicGTCfg
 )
 
 def get_dataset(

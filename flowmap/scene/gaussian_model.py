@@ -18,6 +18,7 @@ from math import floor
 from ..utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from ..utils.sh_utils import RGB2SH
+from ..utils.pose_utils import get_tensor_from_camera
 from simple_knn._C import distCUDA2
 from ..utils.graphics_utils import BasicPointCloud
 from ..utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -76,6 +77,12 @@ class GaussianModel:
         self.percent_dense = 0  # 设置在训练过程中，用于密集化处理的3D高斯点的比例
         self.spatial_lr_scale = 0
 
+        self._depth_from_flowmap = torch.empty(0)  ###
+        self._xyz_from_flowmap = torch.empty(0)
+        self.P = torch.empty(0)
+        self._depth_scale = torch.empty(0)
+        self._depth_shift = torch.empty(0)
+
         # 调用setup_functions来初始化一些处理函数
         self.setup_functions()
 
@@ -93,9 +100,10 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.P,  ######
         )
 
-    def restore(self, model_args, training_args):
+    def restore(self, model_args, training_args):  # 如果提供了checkpoint，则从checkpoint加载模型参数并恢复训练进度
         (self.active_sh_degree,
          self._xyz,
          self._features_dc,
@@ -107,7 +115,8 @@ class GaussianModel:
          xyz_gradient_accum,
          denom,
          opt_dict,
-         self.spatial_lr_scale) = model_args
+         self.spatial_lr_scale,
+         self.P) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -126,6 +135,22 @@ class GaussianModel:
         return self._xyz
 
     @property
+    def get_xyz_from_flowmap(self):
+        return self._xyz_from_flowmap
+
+    @property
+    def get_depth_scale(self):
+        return self._depth_scale
+
+    @property
+    def get_depth_shift(self):
+        return self._depth_shift
+
+    @property
+    def get_depth_from_flowmap(self):
+        return self._depth_from_flowmap
+
+    @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
@@ -141,6 +166,95 @@ class GaussianModel:
     def oneupSHdegree(self):  # 每 1000 次迭代，增加球谐函数的阶数。
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    # def init_RT_seq(self, cam_list):  # cam_list: {1.0: [cam1, cam2, ...], 0.5: [cam1, cam2, ...]}    self.train_cameras
+    #     poses = []
+    #     for cam in cam_list:
+    #     # for cam in cam_list[1.0]:
+    #         p = get_tensor_from_camera(cam.world_view_transform.transpose(0, 1))  # R T -> quat t        # torch.cat([quat, tran])
+    #         poses.append(p)
+    #     poses = torch.stack(poses)
+    #     self.P = poses.cuda().requires_grad_(True)
+
+    def init_RT_seq(self,
+                    viewpoint_cam):  # cam_list: {1.0: [cam1, cam2, ...], 0.5: [cam1, cam2, ...]}    self.train_cameras
+        p = get_tensor_from_camera(
+            viewpoint_cam.world_view_transform.transpose(0, 1))  # R T -> quat t        # torch.cat([quat, tran])
+        self.P = p.cuda().requires_grad_(True)
+        return self.P
+
+    def get_RT(self, idx):
+        pose = self.P[idx]
+        return pose
+
+    # def xyz_from_flowmap(depths, intrinsics, extrinsics, batch, num_images=-1):
+
+    def get_xyz_from_depthflowmap(self, depths, intrinsics, extrinsics, batch, num_images=-1):
+        # depth_diff = depths[:, view_point_selcetion, :, :]             # [1,N,H,W]   [H*W, 1*N]
+        # self._depth_from_flowmap = nn.Parameter(depth_diff.requires_grad_(True))
+        _, _, dh, dw = depths.shape  # ([1, 20, 160, 224])
+        xy, _ = sample_image_grid((dh, dw), extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
+        if num_images == -1:
+            bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+                extrinsics[0],  # torch.Size ([20, 3, 3])
+                intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+                depths[0],  # ([20, 160, 224])
+                batch.videos[0],  # ([20, 3, 160, 224])
+            )
+        else:
+            from math import floor
+            train_view = []
+            length = depths.shape[1]
+            interval = floor((length - num_images) / (num_images - 1))
+            for i in range(0, length):
+                if i % (interval + 1) == 0:
+                    train_view.append(i)
+            train_view[-1] = length - 1  # 强制让最后一个值为总数200
+            # 提取batch, depths, intrinsics, extrinsics 的train_view
+            batch_fewshot = []
+            depth_fewshot = []
+            intrinsics_fewshot = []
+            extrinsics_fewshot = []
+            for i in train_view:
+                batch_fewshot.append(batch.videos[:, i])  # batch.videos: [1, 200, 3, xxx, xxx]
+                depth_fewshot.append(depths[:, i])
+                intrinsics_fewshot.append(intrinsics[:, i])
+                extrinsics_fewshot.append(extrinsics[:, i])
+            batch_fewshot = torch.cat(batch_fewshot, dim=0)
+            depth_fewshot = torch.cat(depth_fewshot, dim=0)
+            intrinsics_fewshot = torch.cat(intrinsics_fewshot, dim=0)
+            extrinsics_fewshot = torch.cat(extrinsics_fewshot, dim=0)
+            bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+                extrinsics_fewshot,  # torch.Size ([20, 3, 3])
+                intrinsics_fewshot,  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+                depth_fewshot,  # ([20, 160, 224])
+                batch_fewshot,  # ([20, 3, 160, 224])
+            )
+
+        points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
+        points_ = []
+        # colors = []
+        for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。
+            xyz = unproject(xy, depths, intrinsics)  # 使用unproject函数将图像坐标和深度值转换为3D空间中的点(相机坐标系)
+            xyz = homogenize_points(xyz)  # 将3D点同质化，即增加一个维度以便于矩阵乘法。
+            xyz = einsum(extrinsics, xyz, "i j, ... j -> ... i")[..., :3]  # 将外参矩阵与同质化的3D点相乘，得到世界坐标系中的3D点，并去除同质化的维度。
+            # points.append(rearrange(xyz, "h w xyz -> (h w) xyz").detach().cpu().numpy())  # 将转换后的3D点和颜色分别添加到对应的列表中
+            # colors.append(rearrange(rgb, "c h w -> (h w) c").detach().cpu().numpy())
+            xyz_ = rearrange(xyz, "h w xyz -> (h w) xyz")
+            points_.append(xyz_)
+        # points = np.concatenate(points)  # 将所有3D点和颜色合并成一个NumPy数组
+
+        points_3d_ = torch.cat(points_, dim=0)
+        # return points_3d_
+
+        self._xyz_from_flowmap = points_3d_
+
+        # colors = np.concatenate(colors)
+        # points_3d = torch.from_numpy(np.asarray(points)).float().cuda()
+
+        # self._xyz_from_flowmap = nn.Parameter(points_3d.requires_grad_(True))
+        # self._xyz =              nn.Parameter(fused_point_cloud.requires_grad_(True))
+        # return points_3d
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):  # 用于从给定的点云数据 pcd 创建对象的初始化状态。
         """
@@ -192,17 +306,56 @@ class GaussianModel:
         # print("self._opacity", self._opacity.shape)             # [28478, 1] # tensor([[-2.1972], ..., [-2.1972]], device='cuda:0', requires_grad=True)
         # print("self.max_radii2D", self.max_radii2D.shape)       # [28478] # tensor([0., 0., 0.,  ..., 0., 0., 0.], device='cuda:0')
 
-    def create_gaussian_params(self, intrinsics, extrinsics, depths, batch, spatial_lr_scale):
-        self.spatial_lr_scale = spatial_lr_scale     # 0.088
+    def create_gaussian_params(self, intrinsics, extrinsics, depths, batch, spatial_lr_scale, model_path,
+                               num_images=-1):
+        self.spatial_lr_scale = spatial_lr_scale  # 0.088
+        # depths_diff_gs = depths.clone()
+        # depths_diff_gs.detach()
+        # depths_diff_gs = torch.tensor(depths)
+        depths_diff_gs = torch.zeros_like(depths)
+        self._depth_from_flowmap = nn.Parameter(depths_diff_gs.requires_grad_(True))
+        self._depth_scale = nn.Parameter(torch.tensor(0.).requires_grad_(True))
+        self._depth_shift = nn.Parameter(torch.tensor(0.).requires_grad_(True))
         _, _, dh, dw = depths.shape  # ([1, 20, 160, 224])
         xy, _ = sample_image_grid((dh, dw), extrinsics.device)  # 生成图像网格的坐标，这些坐标用于后续的3D点云生成。
-        bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
-            extrinsics[0],  # torch.Size ([20, 3, 3])
-            intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
-            depths[0],  # ([20, 160, 224])
-            batch.videos[0],  # ([20, 3, 160, 224])
-            # batch[0],  # ([20, 3, 160, 224])
-        )
+
+        if num_images != -1:
+            train_view = []
+            length = depths.shape[1]
+            interval = floor((length - num_images) / (num_images - 1))
+            for i in range(0, length):
+                if i % (interval + 1) == 0:
+                    train_view.append(i)
+            train_view[-1] = length - 1
+            # 提取batch, depths, intrinsics, extrinsics 的train_view
+            batch_fewshot = []
+            depth_fewshot = []
+            intrinsics_fewshot = []
+            extrinsics_fewshot = []
+            for i in train_view:
+                batch_fewshot.append(batch.videos[:, i])  # batch.videos: [1, 200, 3, xxx, xxx]
+                depth_fewshot.append(depths[:, i])
+                intrinsics_fewshot.append(intrinsics[:, i])
+                extrinsics_fewshot.append(extrinsics[:, i])
+            batch_fewshot = torch.cat(batch_fewshot, dim=0)
+            depth_fewshot = torch.cat(depth_fewshot, dim=0)
+            intrinsics_fewshot = torch.cat(intrinsics_fewshot, dim=0)
+            extrinsics_fewshot = torch.cat(extrinsics_fewshot, dim=0)
+            bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+                extrinsics_fewshot,  # torch.Size ([20, 4, 4])
+                intrinsics_fewshot,  # torch.Size([20, 3, 3])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+                depth_fewshot,  # ([20, 160, 224])
+                batch_fewshot,  # ([20, 3, 160, 224])
+            )
+
+        else:
+            bundle = zip(  # zip函数将外参、内参、深度图像和颜色图像打包在一起，以便在循环中一起处理。
+                extrinsics[0],  # torch.Size ([20, 3, 3])
+                intrinsics[0],  # torch.Size([20, 4, 4])       # 这里的intrinsic也应该是对应的original尺寸下的intrinsic
+                depths[0],  # ([20, 160, 224])
+                batch.videos[0],  # ([20, 3, 160, 224])
+                # batch[0],  # ([20, 3, 160, 224])
+            )
         points = []  # 初始化两个空列表，用于存储转换后的3D点和对应的颜色。
         colors = []
         for extrinsics, intrinsics, depths, rgb in bundle:  # 循环遍历之前打包的数据。
@@ -217,8 +370,9 @@ class GaussianModel:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
         pcd.colors = o3d.utility.Vector3dVector(colors)
-
-        o3d.io.write_point_cloud("/data2/hkk/3dgs/flowmap/outputs/local/output/input.ply", pcd)
+        pcd_path = os.path.join(model_path, "input.ply")
+        o3d.io.write_point_cloud(pcd_path, pcd)
+        # o3d.io.write_point_cloud("/data2/hkk/3dgs/flowmap/outputs/local/output/input.ply", pcd)
 
         # 将点云的点坐标转换为 PyTorch 张量，并移到GPU上。
         fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()  # [716800,3]
@@ -266,23 +420,22 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))  # 不透明度
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-
     def create_fewshot_gaussian_params(self, intrinsics, extrinsics, depths, batch, spatial_lr_scale, num_images):
-        self.spatial_lr_scale = spatial_lr_scale     # 0.088
+        self.spatial_lr_scale = spatial_lr_scale  # 0.088
         train_view = []
         length = depths.shape[1]
         interval = floor((length - num_images) / (num_images - 1))
         for i in range(0, length):
             if i % (interval + 1) == 0:
                 train_view.append(i)
-        train_view[-1] = length - 1     # 强制让最后一个值为总数200
+        train_view[-1] = length - 1  # 强制让最后一个值为总数200
         # 提取batch, depths, intrinsics, extrinsics 的train_view
         batch_fewshot = []
         depth_fewshot = []
         intrinsics_fewshot = []
         extrinsics_fewshot = []
         for i in train_view:
-            batch_fewshot.append(batch.videos[:, i])        # batch.videos: [1, 200, 3, xxx, xxx]
+            batch_fewshot.append(batch.videos[:, i])  # batch.videos: [1, 200, 3, xxx, xxx]
             depth_fewshot.append(depths[:, i])
             intrinsics_fewshot.append(intrinsics[:, i])
             extrinsics_fewshot.append(extrinsics[:, i])
@@ -361,7 +514,6 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))  # 旋转
         self._opacity = nn.Parameter(opacities.requires_grad_(True))  # 不透明度
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-
 
     def create_pcd_from_image_and_depth(self, rgb, depths, intrinsics, extrinsics, spatial_lr_scale):
 
@@ -495,33 +647,86 @@ class GaussianModel:
         # print("self.xyz_gradient_accum.shape00000", self.xyz_gradient_accum.shape)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")  # # [761800,1]
 
-        l = [      # xyz不去进行优化，只是通过flowmap的depth和cameras unproject得到，但是，怎么把这个xyz值传入到gaussian里面呢?  需要去看下mvsplat的代码
-            # {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},   # self.spatial_lr_scale: 0.0884
-            # 0.0016*0.0089
+        l = [  # xyz不去进行优化，只是通过flowmap的depth和cameras unproject得到，但是，怎么把这个xyz值传入到gaussian里面呢?  需要去看下mvsplat的代码
+            # {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},   # self.spatial_lr_scale: 0.0884# 0.0016*0.0089
+            # {'params': [self._xyz_from_flowmap], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz_from_flowmap"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}  # 0.001
         ]
-        print("===============")
-        print("l:", l)
+        # print("===============")
+        # print("l:", l)
 
+        l_cam = [{'params': [self.P], 'lr': training_args.rotation_lr * 0.1, "name": "pose"}, ]
+
+        # l_depth = [{'params': [self._depth_from_flowmap], 'lr': training_args.rotation_lr * 0.1, "name": "depth"}, ]
+        l_depth = [
+            {'params': [self._depth_from_flowmap], 'lr': training_args.position_lr_init * self.spatial_lr_scale * 0.1,
+             "name": "depth"},
+            # {'params': [self._depth_scale], 'lr': 0.1, "name": "depth_scale"},
+            # {'params': [self._depth_shift], 'lr': 0.01, "name": "depth_shift"},
+            ]
+
+        l += l_cam
+        l += l_depth
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)  # lr=0.0
+        # print("optimizer_gaussian: ", self.optimizer)
+
         # print("lr: ", lr)
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,     # self.spatial_lr_scale: 0.0884
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
+                                                    # self.spatial_lr_scale: 0.0884
                                                     lr_final=training_args.position_lr_final * self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+
+        self.cam_scheduler_args = get_expon_lr_func(  # lr_init=0,
+            # lr_final=0,
+            lr_init=training_args.rotation_lr * 0.1,
+            lr_final=training_args.rotation_lr * 0.001,
+            # lr_init=training_args.position_lr_init*self.spatial_lr_scale*10,
+            # lr_final=training_args.position_lr_final*self.spatial_lr_scale*10,
+            lr_delay_mult=training_args.position_lr_delay_mult,
+            max_steps=1000)
+
+        self.depth_scheduler_args = get_expon_lr_func(  # lr_init=0,
+            # lr_final=0,
+            lr_init=training_args.rotation_lr * 0.1,
+            lr_final=training_args.rotation_lr * 0.001,
+            # lr_init=training_args.position_lr_init*self.spatial_lr_scale*10,
+            # lr_final=training_args.position_lr_final*self.spatial_lr_scale*10,
+            lr_delay_mult=training_args.position_lr_delay_mult,
+            max_steps=30000)
+
+    def requires_grad_(self, requires_grad=True):
+        self._xyz.requires_grad_(requires_grad)
+        self._features_dc.requires_grad_(requires_grad)
+        self._features_rest.requires_grad_(requires_grad)
+        self._scaling.requires_grad_(requires_grad)
+        self._rotation.requires_grad_(requires_grad)
+        self._opacity.requires_grad_(requires_grad)
+        self._xyz_from_flowmap.requires_grad_(requires_grad)
 
     def update_learning_rate(self, iteration):  # 更新学习率
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
+                # if param_group["name"] == "xyz_from_flowmap":
                 lr = self.xyz_scheduler_args(iteration)  # iteration=1, lr=0.0   lr 0.00014252474891512246
-                param_group['lr'] = lr          # 0.00014140518517456526     # 0.00014137262917571146
-                print("lr: ", lr)
-                return lr
+                param_group['lr'] = lr  # 0.00014140518517456526     # 0.00014137262917571146
+                print("lr_xyz: ", lr)
+                # return lr
+            if param_group["name"] == "pose":
+                lr = self.cam_scheduler_args(iteration)
+                # print("pose learning rate", iteration, lr)
+                param_group['lr'] = lr
+                # print("lr_pose: ", lr)
+            if param_group["name"] == "depth":
+                lr = self.depth_scheduler_args(iteration)
+                # print("pose learning rate", iteration, lr)
+                param_group['lr'] = lr
+                # print("lr_depth: ", lr)
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -556,10 +761,14 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def save_ply_xyz(self, path, xyz_flowmap):
+    def save_ply_xyz(self, path, xyz_flowmap=None):
         mkdir_p(os.path.dirname(path))
 
-        xyz = xyz_flowmap.detach().cpu().numpy()
+        # depth_mixed = 0.5 * self.get_depth_from_flowmap + 0.5 * depth_from_flowmap  # 1.0869   1.04275
+        # xyz_from_flowmap = self.get_xyz_from_depthflowmap(depth_mixed, intrinsics_uncropped, extrinsics, rgb, num_images=-1)
+        # xyz = xyz_from_flowmap.detach().cpu().numpy()
+
+        xyz = self._xyz_from_flowmap.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
@@ -615,6 +824,7 @@ class GaussianModel:
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz_from_flowmap = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(
             torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(
                 True))

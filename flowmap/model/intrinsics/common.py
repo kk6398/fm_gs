@@ -9,7 +9,7 @@ def focal_lengths_to_intrinsics(
 ) -> Float[Tensor, "*batch 3 3"]:
     device = focal_lengths.device
     h, w = image_shape
-    focal_lengths = focal_lengths * (h * w) ** 0.5
+    focal_lengths = focal_lengths * (h * w) ** 0.5       # focal_lengths: 0.500~2.000, 均匀采样60个值
 
     intrinsics = torch.eye(3, dtype=torch.float32, device=device)
     intrinsics[:2, 2] = 0.5

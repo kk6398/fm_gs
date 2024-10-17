@@ -57,6 +57,20 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
+
+def getWorld2View3(R, t, translate=torch.tensor([.0, .0, .0]), scale=1.0):
+    Rt = torch.zeros((4, 4), device=R.device)
+    Rt[:3, :3] = R.transpose(0, 1)
+    Rt[:3, 3] = t
+    Rt[3, 3] = 1.0
+
+    C2W = torch.inverse(Rt)
+    cam_center = C2W[:3, 3]
+    # cam_center = (cam_center + translate) * scale
+    C2W[:3, 3] = cam_center
+    Rt = torch.inverse(C2W)
+    return Rt.float()
+
 def getProjectionMatrix(znear, zfar, fovX, fovY):
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
@@ -66,7 +80,7 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     right = tanHalfFovX * znear
     left = -right
 
-    P = torch.zeros(4, 4)
+    P = torch.zeros(4, 4)     # 和COGS有点区别
 
     z_sign = 1.0
 

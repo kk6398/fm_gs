@@ -43,6 +43,7 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
     Returns:
         quaternions with real part first, as tensor of shape (..., 4).
     """
+    matrix = matrix[: ,:3, :3]
     if matrix.size(-1) != 3 or matrix.size(-2) != 3:
         raise ValueError(f"Invalid rotation matrix  shape f{matrix.shape}.")
 
@@ -86,7 +87,7 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
            torch.nn.functional.one_hot(q_abs.argmax(dim=-1), num_classes=4) > 0.5, :  # pyre-ignore[16]
            ].reshape(*batch_dim, 4)
 
-def save_json(scene_info):
+def save_json(scene_info,model_path):
     json_cams = []
     camlist = []
 
@@ -96,7 +97,7 @@ def save_json(scene_info):
         camlist.extend(scene_info.train_cameras)
     for id, cam in enumerate(camlist):  # cam: CameraInfo
         json_cams.append(camera_to_JSON(id, cam))
-    output_dir = "/data2/hkk/3dgs/flowmap/outputs/local/output/"
+    output_dir = model_path
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "cameras.json"), 'w') as file:
         json.dump(json_cams, file)
@@ -152,17 +153,20 @@ def xyz_from_flowmap(depths, intrinsics, extrinsics, batch, num_images=-1):
         # colors.append(rearrange(rgb, "c h w -> (h w) c").detach().cpu().numpy())
     points = np.concatenate(points)  # 将所有3D点和颜色合并成一个NumPy数组
     # colors = np.concatenate(colors)
+    points_3d = torch.from_numpy(np.asarray(points)).float().cuda()
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+    return points_3d
+
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points)
     # pcd.colors = o3d.utility.Vector3dVector(colors)
 
-    o3d.io.write_point_cloud("/data2/hkk/3dgs/flowmap/outputs/fused_point_cloud.ply", pcd)
+    # o3d.io.write_point_cloud("/data2/hkk/3dgs/flowmap/outputs/fused_point_cloud.ply", pcd)
 
     # 将点云的点坐标转换为 PyTorch 张量，并移到GPU上。
-    fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()  # [716800,3]
+    # fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()  # [716800,3]
 
-    return fused_point_cloud
+    # return fused_point_cloud
 
 
 def center_crop_intrinsics(
@@ -257,7 +261,8 @@ def flowmap_2_gs(intrinsics, extrinsics, frame_paths, batch_video):
         # w2c = extrinsic_matrix.detach().cpu().numpy()  # 此时外参是C2W, 需要转换乘W2C
         w2c = extrinsic_matrix.inverse().detach().cpu().numpy()
         qx, qy, qz, qw = R.from_matrix(w2c[:3, :3]).as_quat()  # R: Rotation
-        qvec = np.array((qw, qx, qy, qz))
+        # qvec = np.array((qw, qx, qy, qz)).float32()
+        qvec = np.array((qw, qx, qy, qz), dtype=np.float32)
         # qvec = R.from_matrix(w2c[:3, :3]).as_quat()  # R: Rotation
         tvec = w2c[:3, 3]
         camera_id = 1

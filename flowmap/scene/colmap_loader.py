@@ -65,6 +65,28 @@ def rotmat2qvec(R):
         qvec *= -1
     return qvec
 
+import torch
+def rotmat2qvec_tenosr(R):
+    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.view(-1)
+    K = torch.zeros((4, 4), device=R.device)
+    K[0, 0] = Rxx - Ryy - Rzz
+    K[1, 0] = Ryx + Rxy
+    K[1, 1] = Ryy - Rxx - Rzz
+    K[2, 0] = Rzx + Rxz
+    K[2, 1] = Rzy + Ryz
+    K[2, 2] = Rzz - Rxx - Ryy
+    K[3, 0] = Ryz - Rzy
+    K[3, 1] = Rzx - Rxz
+    K[3, 2] = Rxy - Ryx
+    K[3, 3] = Rxx + Ryy + Rzz
+    K /= 3.0
+
+    eigvals, eigvecs = torch.linalg.eigh(K)
+    qvec = eigvecs[[3, 0, 1, 2], torch.argmax(eigvals)]
+    if qvec[0] < 0:
+        qvec *= -1
+    return qvec
+
 class Image(BaseImage):
     def qvec2rotmat(self):
         return qvec2rotmat(self.qvec)

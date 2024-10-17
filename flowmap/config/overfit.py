@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..model.model_wrapper_overfit_eval import ModelWrapperOverfitevalCfg
 from ..model.model_wrapper_overfit import ModelWrapperOverfitCfg
 from ..tracking import TrackPrecomputationCfg, TrackPredictorCfg
 from .common import CommonCfg
@@ -11,5 +12,6 @@ class OverfitCfg(CommonCfg):         # 继承自 CommonCfg。这意味着 Overfi
     tracking: TrackPredictorCfg
     track_precomputation: TrackPrecomputationCfg
     model_wrapper: ModelWrapperOverfitCfg
+    # model_wrapper: ModelWrapperOverfitevalCfg
     local_save_root: Path | None
     # opt_params: OptparamsCfg

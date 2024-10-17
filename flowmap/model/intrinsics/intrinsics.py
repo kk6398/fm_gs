@@ -25,5 +25,5 @@ class Intrinsics(nn.Module, ABC, Generic[T]):
         flows: Flows,
         backbone_output: BackboneOutput,
         global_step: int,
-    ) -> Float[Tensor, "batch frame 3 3"]:
+    ) -> Float[Tensor, "batch frame 3 3"]:       ###需要在这里return 3x3 的 normlize intrinsics
         pass

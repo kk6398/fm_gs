@@ -47,13 +47,20 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
+        # self._source_path = "/data2/hkk/3dgs/flowmap/outputs/local_3_288x544_gs"
+        # self._model_path = "/data2/hkk/3dgs/flowmap/outputs/local_3_288x544_gs/output"
         self._source_path = "/data2/hkk/3dgs/flowmap/outputs/local/"
         self._model_path = "/data2/hkk/3dgs/flowmap/outputs/local/output"
+
         self._images = "images"
         self._resolution = -1
+        self._load_iteration = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = True    # False
+        self.eval = False  # False   True
+        self.llffhold = 10
+        self.num_images = -1        # 3 6 12    -1
+        self.testeval = 0      # 0 1
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

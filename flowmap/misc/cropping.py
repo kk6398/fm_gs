@@ -64,8 +64,8 @@ def center_crop_intrinsics(
     h_old, w_old = old_shape    # 160  224
     h_new, w_new = new_shape    # (180, 240)
     intrinsics = intrinsics.clone()
-    intrinsics[..., 0, 0] *= w_old / w_new  # fx      # * 180/160
-    intrinsics[..., 1, 1] *= h_old / h_new  # fy      # * 240/224
+    intrinsics[..., 0, 0] *= w_old / w_new  # fx      #    *(160/180)
+    intrinsics[..., 1, 1] *= h_old / h_new  # fy      #    *(224/240)
     return intrinsics
 
 
@@ -89,7 +89,7 @@ def get_image_shape(
         return cfg.image_shape          # 43200
 
     # Otherwise, the image shape is assumed to be an approximate number of pixels.
-    h, w = original_shape        # 3024, 4032
+    h, w = original_shape        # 3024, 4032   # 546, 976
     # print("h: ", h)
     # print("w: ", w)
     # print("cfg.image_shape: ", cfg.image_shape)
@@ -103,7 +103,7 @@ def crop_and_resize_batch_for_model(
     cfg: CroppingCfg,       # cfg.cropping: CroppingCfg(image_shape=43200, flow_scale_multiplier=4, patch_size=32)
 ) -> tuple[Batch, tuple[int, int]]:
     # Resize the batch to the desired model input size.           # [3, 3024, 4032]
-    image_shape = get_image_shape(tuple(batch.videos.shape[-2:]), cfg)       # (180, 240)
+    image_shape = get_image_shape(tuple(batch.videos.shape[-2:]), cfg)       # (180, 240)      # cfg.image_shape:43200 or 172800  总像素点   # 172800: 311, 556
     batch = resize_batch(batch, image_shape)               # 通过F.interpolate # [1, 20, 3, 180, 240]
 
     # print("batch: ", batch)
@@ -118,7 +118,7 @@ def crop_and_resize_batch_for_model(
 def crop_and_resize_batch_for_flow(batch: Batch, cfg: CroppingCfg) -> Batch:
     # Figure out the image size that's used for flow.
     image_shape = get_image_shape(tuple(batch.videos.shape[-2:]), cfg)
-    flow_shape = tuple(dim * cfg.flow_scale_multiplier for dim in image_shape)
+    flow_shape = tuple(dim * cfg.flow_scale_multiplier for dim in image_shape) # cfg.flow_scale_multiplier: 决定是图像尺寸的多少倍
 
     # Resize the batch to match the desired flow shape.
     batch = resize_batch(batch, flow_shape)

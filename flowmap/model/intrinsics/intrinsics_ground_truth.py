@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
+import torch
 from jaxtyping import Float
 from torch import Tensor
 
